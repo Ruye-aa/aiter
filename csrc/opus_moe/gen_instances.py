@@ -25,6 +25,8 @@ from opus_moe_common import (  # noqa: E402
     OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT,
     OPUS_A8W4_OUT_MODE_ATOMIC,
     OPUS_A8W4_ROUTE_REDUCE_INSTANCES,
+    OPUS_A8W4_STAGE1_CONTRACTS,
+    STAGE1_A8W4_KERNELS,
     STAGE2_A8W4_KERNELS,
     STAGE2_BF16_KERNELS,
     opus_a8w4_decode_kid,
@@ -69,6 +71,35 @@ namespace opus_moe
 
 A8W4_META_FOOTER = """
 } // namespace opus_moe
+"""
+
+STAGE1_A8W4_META_HEADER = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated. Do not edit. See csrc/opus_moe/gen_instances.py.
+//
+// A8W4 stage1 metadata generated from
+// aiter/ops/opus_moe_stage1_a8w4_meta.py.
+
+namespace opus_moe
+{
+
+"""
+
+STAGE1_A8W4_META_FOOTER = """
+} // namespace opus_moe
+"""
+
+STAGE1_A8W4_MANIFEST_HEADER = """#pragma once
+// SPDX-License-Identifier: MIT
+// Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+//
+// Auto-generated. Do not edit. See csrc/opus_moe/gen_instances.py.
+//
+// A8W4 stage1 kid -> launcher cases. Generated from structured metadata so
+// Python runtime metadata and C++ dispatch cases do not drift.
+
 """
 
 
@@ -406,6 +437,225 @@ def _emit_a8w4_manifest_header(effective_inter_dims: tuple[int, ...]) -> str:
     return "".join(lines)
 
 
+def _stage1_cpp_const_name(inst) -> str:
+    trait = str(inst.trait)
+    prefix = "OpusMoeStage1A8W4"
+    if not trait.startswith(prefix):
+        raise ValueError(f"unexpected Opus A8W4 stage1 trait name: {trait}")
+    suffix = trait[len(prefix) :]
+    return f"kStage1KidA8W4{suffix}"
+
+
+def _stage1_cpp_contract_alias(contract) -> str:
+    return f"OpusMoeStage1A8W4{_cpp_name_suffix(contract.name)}Contract"
+
+
+def _stage1_cpp_shape(inst) -> str:
+    if inst.block_n != 384:
+        raise ValueError(
+            "Opus A8W4 stage1 device pipeline currently fixes block_n=384, "
+            f"got kid {inst.kid}: block_n={inst.block_n}"
+        )
+    if inst.sort_block_m != inst.block_m:
+        raise ValueError(
+            "Opus A8W4 stage1 device pipeline assumes "
+            f"sort_block_m == block_m, got kid {inst.kid}: "
+            f"{inst.sort_block_m} != {inst.block_m}"
+        )
+    default_groups = (inst.block_n // 2) // 32
+    effective_groups = (
+        inst.output_scale_groups_override
+        if inst.output_scale_groups_override > 0
+        else default_groups
+    )
+    expected_groups = default_groups if inst.gate_up_group_split else 1
+    if effective_groups != expected_groups:
+        raise ValueError(
+            "Opus A8W4 stage1 device pipeline derives output scale groups "
+            f"from gate_up_group_split, got kid {inst.kid}: "
+            f"{effective_groups} != {expected_groups}"
+        )
+    expected_row_split = 2 if inst.gate_up_group_split and inst.block_m >= 32 else 1
+    if inst.epilogue_row_split != expected_row_split:
+        raise ValueError(
+            "Opus A8W4 stage1 device pipeline derives epilogue row split "
+            f"from gate_up_group_split/block_m, got kid {inst.kid}: "
+            f"{inst.epilogue_row_split} != {expected_row_split}"
+        )
+    if not (inst.gate_up_group_split or inst.pair_gate_up_single_group):
+        raise ValueError(
+            "Opus A8W4 stage1 device pipeline requires gate-up group-split "
+            f"or pair-gate-up, got kid {inst.kid}"
+        )
+    policy_args = (
+        inst.gate_up_group_split,
+        inst.k_wave,
+        inst.min_blocks_per_cu_override,
+        inst.skip_invalid_a_scale_guard,
+        inst.pair_gate_up_single_group,
+    )
+    policy = "OpusMoeStage1A8W4Policy<" + ", ".join(
+        _cpp_bool(arg) if isinstance(arg, bool) else str(arg)
+        for arg in policy_args
+    ) + ">"
+    contract = _stage1_cpp_contract_alias(OPUS_A8W4_STAGE1_CONTRACTS[0])
+    return f"OpusMoeStage1A8W4Shape<{inst.block_m}, {policy}, {contract}>"
+
+
+def _emit_stage1_a8w4_meta_header() -> str:
+    lines = [STAGE1_A8W4_META_HEADER]
+    kernels = [STAGE1_A8W4_KERNELS[kid] for kid in sorted(STAGE1_A8W4_KERNELS)]
+    contracts = tuple(OPUS_A8W4_STAGE1_CONTRACTS)
+    kid_values = [inst.kid for inst in kernels]
+    if len(set(kid_values)) != len(kid_values):
+        raise ValueError("duplicate Opus A8W4 stage1 kid value")
+    trait_names = [inst.trait for inst in kernels]
+    if len(set(trait_names)) != len(trait_names):
+        raise ValueError("duplicate Opus A8W4 stage1 trait name")
+    if not contracts:
+        raise ValueError("Opus A8W4 stage1 requires at least one contract")
+    contract_names = [contract.name for contract in contracts]
+    if len(set(contract_names)) != len(contract_names):
+        raise ValueError("duplicate Opus A8W4 stage1 contract name")
+
+    lines.extend(
+        [
+            "template<int ModelDim, int LogicalInterDim, int InterDimPad, "
+            "int Experts, int TopK, int ScaleGroupLogicalK>\n",
+            "struct OpusMoeStage1A8W4Contract\n{\n",
+            "    static constexpr int MODEL_DIM = ModelDim;\n",
+            "    static constexpr int LOGICAL_INTER_DIM = LogicalInterDim;\n",
+            "    static constexpr int INTER_DIM_PAD = InterDimPad;\n",
+            "    static constexpr int EFFECTIVE_INTER_DIM = LogicalInterDim - InterDimPad;\n",
+            "    static constexpr int GATE_UP_LOGICAL_DIM = 2 * LogicalInterDim;\n",
+            "    static constexpr int GATE_UP_EFFECTIVE_DIM = 2 * EFFECTIVE_INTER_DIM;\n",
+            "    static constexpr int EXPERTS = Experts;\n",
+            "    static constexpr int TOPK = TopK;\n",
+            "    static constexpr int SCALE_GROUP_LOGICAL_K = ScaleGroupLogicalK;\n",
+            "};\n\n",
+        ]
+    )
+    for contract in contracts:
+        lines.append(
+            f"using {_stage1_cpp_contract_alias(contract)} = "
+            "OpusMoeStage1A8W4Contract<"
+            f"{contract.model_dim}, "
+            f"{contract.logical_inter_dim}, "
+            f"{contract.inter_dim_pad}, "
+            f"{contract.experts}, "
+            f"{contract.topk}, "
+            f"{contract.scale_group_logical_k}>;\n"
+        )
+    lines.extend(
+        [
+            "using OpusMoeStage1A8W4DefaultContract = "
+            f"{_stage1_cpp_contract_alias(contracts[0])};\n\n",
+            "constexpr bool stage1_a8w4_contract_is_supported(\n",
+            "    int model_dim,\n",
+            "    int logical_inter_dim,\n",
+            "    int inter_dim_pad,\n",
+            "    int experts,\n",
+            "    int topk)\n",
+            "{\n",
+        ]
+    )
+    for idx, contract in enumerate(contracts):
+        alias = _stage1_cpp_contract_alias(contract)
+        prefix = "    return " if idx == 0 else "        || "
+        lines.extend(
+            [
+                prefix,
+                f"(model_dim == {alias}::MODEL_DIM &&\n",
+                f"            logical_inter_dim == {alias}::LOGICAL_INTER_DIM &&\n",
+                f"            inter_dim_pad == {alias}::INTER_DIM_PAD &&\n",
+                f"            experts == {alias}::EXPERTS &&\n",
+                f"            topk == {alias}::TOPK)",
+            ]
+        )
+        lines.append(";\n" if idx == len(contracts) - 1 else "\n")
+    lines.append("}\n\n")
+
+    lines.append(
+        "constexpr bool stage1_a8w4_effective_inter_dim_is_supported(int effective_inter_dim)\n"
+        "{\n    switch(effective_inter_dim)\n    {\n"
+    )
+    for contract in contracts:
+        lines.append(f"    case {_stage1_cpp_contract_alias(contract)}::EFFECTIVE_INTER_DIM:\n")
+    lines.append("        return true;\n    default: return false;\n    }\n}\n\n")
+
+    for inst in kernels:
+        lines.append(f"constexpr int {_stage1_cpp_const_name(inst)} = {inst.kid};\n")
+    lines.extend(
+        [
+            "\nconstexpr int kStage1A8W4KidMin = 1000;\n",
+            "constexpr int kStage1A8W4KidMax = 1099;\n\n",
+            "constexpr bool stage1_a8w4_kid_in_range(int kid)\n",
+            "{\n",
+            "    return kid >= kStage1A8W4KidMin && kid <= kStage1A8W4KidMax;\n",
+            "}\n\n",
+        ]
+    )
+    for inst in kernels:
+        lines.append(
+            f"static_assert(stage1_a8w4_kid_in_range({_stage1_cpp_const_name(inst)}), "
+            '"A8W4 stage1 kids must stay in the 10xx range");\n'
+        )
+    lines.append(
+        "\nconstexpr bool stage1_a8w4_kid_is_valid(int kid)\n"
+        "{\n    switch(kid)\n    {\n"
+    )
+    for inst in kernels:
+        lines.append(f"    case {_stage1_cpp_const_name(inst)}:\n")
+    lines.append("        return true;\n    default: return false;\n    }\n}\n\n")
+
+    for fn_name, field in (
+        ("stage1_a8w4_kid_block_m", "block_m"),
+        ("stage1_a8w4_kid_block_n", "block_n"),
+        ("stage1_a8w4_kid_block_k", "block_k"),
+        ("stage1_a8w4_kid_sort_block_m", "sort_block_m"),
+    ):
+        lines.append(f"constexpr int {fn_name}(int kid)\n{{\n    switch(kid)\n    {{\n")
+        for inst in kernels:
+            lines.append(
+                f"    case {_stage1_cpp_const_name(inst)}: "
+                f"return {getattr(inst, field)};\n"
+            )
+        lines.append("    default: return -1;\n    }\n}\n\n")
+
+    lines.append(
+        "constexpr const char* stage1_a8w4_kid_name(int kid)\n"
+        "{\n    switch(kid)\n    {\n"
+    )
+    for inst in kernels:
+        lines.append(
+            f'    case {_stage1_cpp_const_name(inst)}: '
+            f'return "{_cpp_string(inst.name)}";\n'
+        )
+    lines.append('    default: return "unknown";\n    }\n}\n')
+    lines.append(STAGE1_A8W4_META_FOOTER)
+    return "".join(lines)
+
+
+def _emit_stage1_a8w4_manifest_header() -> str:
+    lines = [STAGE1_A8W4_MANIFEST_HEADER]
+    kernels = [STAGE1_A8W4_KERNELS[kid] for kid in sorted(STAGE1_A8W4_KERNELS)]
+
+    lines.append(f"#define OPUS_MOE_STAGE1_A8W4_LOOKUP_SIZE {len(kernels)}\n")
+    if not kernels:
+        lines.append("#define GENERATE_OPUS_MOE_STAGE1_A8W4_DISPATCH_CASES\n")
+        return "".join(lines)
+
+    lines.append("#define GENERATE_OPUS_MOE_STAGE1_A8W4_DISPATCH_CASES \\\n")
+    for idx, inst in enumerate(kernels):
+        suffix = " \\\n" if idx != len(kernels) - 1 else "\n"
+        lines.append(
+            f"    case opus_moe::{_stage1_cpp_const_name(inst)}: "
+            f"return launch<{_stage1_cpp_shape(inst)}>(kargs, stream);" + suffix
+        )
+    lines.append("\n")
+    return "".join(lines)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Generate Opus MoE stage2 dispatch headers"
@@ -441,6 +691,12 @@ def main() -> None:
     a8w4_manifest_path.write_text(
         _emit_a8w4_manifest_header(effective_inter_dims), encoding="utf-8"
     )
+    stage1_a8w4_meta_path = out_dir / "opus_moe_stage1_a8w4_meta.h"
+    stage1_a8w4_meta_path.write_text(_emit_stage1_a8w4_meta_header(), encoding="utf-8")
+    stage1_a8w4_manifest_path = out_dir / "opus_moe_stage1_a8w4_manifest.h"
+    stage1_a8w4_manifest_path.write_text(
+        _emit_stage1_a8w4_manifest_header(), encoding="utf-8"
+    )
 
     print(
         f"[opus_moe gen_instances] wrote {bf16_manifest_path} with "
@@ -452,6 +708,11 @@ def main() -> None:
         f"effective_inter_dims={effective_inter_dims}"
     )
     print(f"[opus_moe gen_instances] wrote {a8w4_meta_path}")
+    print(
+        f"[opus_moe gen_instances] wrote {stage1_a8w4_manifest_path} with "
+        f"{len(STAGE1_A8W4_KERNELS)} A8W4 stage1 kid(s)"
+    )
+    print(f"[opus_moe gen_instances] wrote {stage1_a8w4_meta_path}")
 
 
 if __name__ == "__main__":

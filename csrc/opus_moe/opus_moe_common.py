@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Opus MoE stage2 codegen metadata bridge.
+"""Opus MoE codegen metadata bridge.
 
-A8W4 stage2 metadata is defined in the Python package because both runtime
-fused_moe glue and csrc codegen need the same kid/name/layout table. This file
-keeps csrc-side generators close to the opus_gemm_common.py pattern while
-re-exporting A8W4 data from the package source of truth.
+A8W4 metadata is defined in the Python package because runtime glue and csrc
+codegen need the same kid/name/layout tables. This file keeps csrc-side
+generators close to the opus_gemm_common.py pattern while re-exporting A8W4
+data from the package source of truth.
 """
 
 from __future__ import annotations
@@ -17,9 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-def _load_a8w4_meta_module():
+def _load_ops_meta_module(rel_meta_path: Path, module_name: str):
     here = Path(__file__).resolve()
-    rel_meta_path = Path("aiter") / "ops" / "opus" / "moe_stage2_a8w4_meta.py"
     candidates = [
         here.parents[2] / rel_meta_path,
     ]
@@ -28,7 +27,7 @@ def _load_a8w4_meta_module():
     for path in candidates:
         if path.exists():
             spec = importlib.util.spec_from_file_location(
-                "_opus_moe_stage2_a8w4_meta", path
+                module_name, path
             )
             if spec is None or spec.loader is None:
                 break
@@ -36,10 +35,17 @@ def _load_a8w4_meta_module():
             sys.modules[spec.name] = module
             spec.loader.exec_module(module)
             return module
-    raise ImportError("unable to locate aiter/ops/opus/moe_stage2_a8w4_meta.py")
+    raise ImportError(f"unable to locate {rel_meta_path.as_posix()}")
 
 
-_a8w4_meta = _load_a8w4_meta_module()
+_a8w4_meta = _load_ops_meta_module(
+    Path("aiter") / "ops" / "opus" / "moe_stage2_a8w4_meta.py",
+    "_opus_moe_stage2_a8w4_meta",
+)
+_a8w4_stage1_meta = _load_ops_meta_module(
+    Path("aiter") / "ops" / "opus_moe_stage1_a8w4_meta.py",
+    "_opus_moe_stage1_a8w4_meta",
+)
 OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS = (
     _a8w4_meta.OPUS_A8W4_CODEGEN_SEED_EFFECTIVE_INTER_DIMS
 )
@@ -49,6 +55,9 @@ OPUS_A8W4_GFX950_DECODE_KERNEL_CONTRACT = (
 OPUS_A8W4_ROUTE_REDUCE_INSTANCES = _a8w4_meta.OPUS_A8W4_ROUTE_REDUCE_INSTANCES
 OPUS_A8W4_OUT_MODE_ATOMIC = _a8w4_meta.OPUS_A8W4_OUT_MODE_ATOMIC
 opus_a8w4_decode_kid = _a8w4_meta.opus_a8w4_decode_kid
+OPUS_A8W4_STAGE1_BY_KID = _a8w4_stage1_meta.OPUS_A8W4_STAGE1_BY_KID
+OPUS_A8W4_STAGE1_CONTRACTS = _a8w4_stage1_meta.OPUS_A8W4_STAGE1_CONTRACTS
+OpusA8W4Stage1Instance = _a8w4_stage1_meta.OpusA8W4Stage1Instance
 
 
 @dataclass(frozen=True)
@@ -78,3 +87,6 @@ STAGE2_BF16_KERNELS = {
 }
 
 STAGE2_A8W4_KERNELS = dict(_a8w4_meta.OPUS_A8W4_STAGE2_BY_KID)
+STAGE1_A8W4_KERNELS: dict[int, OpusA8W4Stage1Instance] = dict(
+    OPUS_A8W4_STAGE1_BY_KID
+)

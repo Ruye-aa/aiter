@@ -137,14 +137,25 @@ int select_a8w4_kernel_id(int requested_kernel_id,
                 opus_moe::stage2_a8w4_kid_name(selected_kernel_id),
                 ")");
     // Validate that the caller sorted with the block_m required by the selected kid.
-    AITER_CHECK(opus_moe::stage2_a8w4_kid_block_m(selected_kernel_id) == block_m,
+    const int kernel_block_m = opus_moe::stage2_a8w4_kid_block_m(selected_kernel_id);
+    const int sort_block_m = opus_moe::stage2_a8w4_kid_sort_block_m(selected_kernel_id);
+    AITER_CHECK(sort_block_m == block_m,
                 "kernel_id=",
                 selected_kernel_id,
                 " (",
                 opus_moe::stage2_a8w4_kid_name(selected_kernel_id),
-                ") requires block_m=",
-                opus_moe::stage2_a8w4_kid_block_m(selected_kernel_id),
+                ") requires sorted block_m=",
+                sort_block_m,
                 ", got ",
+                block_m);
+    AITER_CHECK(block_m % kernel_block_m == 0,
+                "kernel_id=",
+                selected_kernel_id,
+                " (",
+                opus_moe::stage2_a8w4_kid_name(selected_kernel_id),
+                ") uses kernel block_m=",
+                kernel_block_m,
+                ", which must divide sorted block_m=",
                 block_m);
     return selected_kernel_id;
 }

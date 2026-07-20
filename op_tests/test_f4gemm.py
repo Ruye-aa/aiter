@@ -44,6 +44,23 @@ pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
 
 SUPPORTED_GFX = ["gfx1250"]  # gfx1250-only F4GEMM (preload SGPR) path
+
+SUBK = 256  # asm inner-K step: the ONLY hard shape constraint is K % SUBK == 0
+
+# perf sweeps one big square (throughput); func sweeps many small/odd shapes to
+# exercise the K%SUBK boundary and non-square/non-pow2 M,N,K (correctness).
+PERF_SHAPES = [(16384, 16384, 16384)]
+FUNC_SHAPES = [
+    (1024, 1024, 256),  # K == SUBK (smallest legal K)
+    (1024, 1024, 512),  # K = 2*SUBK
+    (1024, 1024, 768),  # K = 3*SUBK (not a power of two)
+    (1024, 1024, 1280),  # K = 5*SUBK
+    (2048, 1024, 256),  # non-square M>N, min K
+    (1024, 2048, 768),  # non-square N>M, K not %1024
+    (2048, 2048, 2048),  # mid square
+    (4096, 4096, 512),  # larger M/N, small K
+]
+
 MXFP4_SCALE_BLOCK = 32
 NVFP4_SCALE_BLOCK = 16
 # mxfp8 OUTPUT block size along N: the kernel quantizes each 128-wide output block
@@ -490,7 +507,7 @@ def main():
         "--mode",
         choices=["func", "perf", "profile"],
         default="perf",
-        help="func=acc only (no table), perf=acc+timing table, profile=perf+trace",
+        help="func=acc+timing table (fewer iters), perf=acc+timing table, profile=perf+trace",
     )
     parser.add_argument(
         "-d",
@@ -507,9 +524,11 @@ def main():
         "--shape",
         type=dtypes.str2tuple,
         nargs="*",
-        # cluster(4x4)+persistent friendly for the 256x256 tile: M%1024, N%1024.
-        default=[(16384, 16384, 16384)],
-        help="(M,N,K) tuples, e.g. -mnk 2048,2048,2048 16384,16384,16384",
+        # Unset -> per-mode defaults: perf=PERF_SHAPES (one big square, throughput),
+        # func=FUNC_SHAPES (many small/odd shapes, correctness). K must be %SUBK.
+        default=None,
+        help="(M,N,K) tuples, e.g. -mnk 2048,2048,2048 16384,16384,16384; "
+        "unset uses PERF_SHAPES (perf/profile) or FUNC_SHAPES (func)",
     )
     args = parser.parse_args()
 
@@ -527,6 +546,13 @@ def main():
             "(or length 1 to broadcast)"
         )
     init_pairs = list(zip(di_list, si_list))
+
+    # Shapes: explicit --shape wins; otherwise func sweeps the many small/odd
+    # correctness shapes and perf/profile sweep the single throughput square.
+    if args.shape is not None:
+        shapes = args.shape
+    else:
+        shapes = FUNC_SHAPES if args.mode == "func" else PERF_SHAPES
 
     for dtype in args.dtype:  # one table per output dtype
         # init pair is the OUTERMOST product term -> rows are grouped by
@@ -548,20 +574,17 @@ def main():
                 knl_name=args.knl_name,
             )
             for (di, si), intype, apre, sc, ot, (M, N, K) in itertools.product(
-                init_pairs, args.intype, args.apre, args.scale, args.outtype, args.shape
+                init_pairs, args.intype, args.apre, args.scale, args.outtype, shapes
             )
         ]
-        if args.mode != "func":
-            df = pd.DataFrame(rows)
-            # These are constant within a table (seed/mode/dtype fixed per run,
-            # gfx fixed per box); drop them to keep the summary compact.
-            df = df.drop(
-                columns=["seed", "mode", "dtype", "gfx", "knl_name"], errors="ignore"
-            )
-            aiter.logger.info(
-                "gemm_a4w4 (F4GEMM) summary (markdown):\n%s",
-                df.to_markdown(index=False),
-            )
+        df = pd.DataFrame(rows)
+        # These are constant within a table (seed/mode/dtype fixed per run,
+        # gfx fixed per box); drop them to keep the summary compact.
+        df = df.drop(columns=["seed", "dtype", "gfx", "knl_name"], errors="ignore")
+        aiter.logger.info(
+            "gemm_a4w4 (F4GEMM) summary (markdown):\n%s",
+            df.to_markdown(index=False),
+        )
 
 
 if __name__ == "__main__":

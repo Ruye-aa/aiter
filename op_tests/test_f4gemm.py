@@ -311,7 +311,18 @@ def test_gemm(
         + out_bytes
     )
 
-    ret = {"gfx": get_gfx()}
+    # Report the ACTUAL kernel used in the table (the knl_name column, which by
+    # default carries only the request arg -- None -> empty). Heuristic dispatch
+    # (knl_name None) and "auto" both resolve to the per-config kernel, whose
+    # mangled symbol is _ZN5aiter<len(base)><base>E (same as the "auto" branch);
+    # an explicit verbatim knl_name is shown as-is. This overwrites the same-named
+    # call-arg column in place (benchmark() does callargs.update(ret)).
+    actual_knl = (
+        knl_name
+        if (knl_name and knl_name != "auto")
+        else f"_ZN5aiter{len(base)}{base}E"
+    )
+    ret = {"gfx": get_gfx(), "knl_name": actual_knl}
     for name, fn in candidates.items():
         try:
             out, us = run_perftest(fn, num_iters=num_iters, needTrace=needTrace)
@@ -542,6 +553,11 @@ def main():
         ]
         if args.mode != "func":
             df = pd.DataFrame(rows)
+            # These are constant within a table (seed/mode/dtype fixed per run,
+            # gfx fixed per box); drop them to keep the summary compact.
+            df = df.drop(
+                columns=["seed", "mode", "dtype", "gfx", "knl_name"], errors="ignore"
+            )
             aiter.logger.info(
                 "gemm_a4w4 (F4GEMM) summary (markdown):\n%s",
                 df.to_markdown(index=False),

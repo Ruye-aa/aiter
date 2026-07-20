@@ -7,7 +7,11 @@
 # candidate, one markdown summary table, and a __main__ guard).
 #
 # One timed candidate per (intype, shape, apre) row:
-#   asm : the low-level asm entry with the tile kernel forced by name
+#   asm : the low-level asm entry. By default dispatch is heuristic (no explicit
+#         kernelName): the aiter op picks the .co from f4gemm.csv by
+#         (intype, a_preshuffle, outtype), so the test also validates the op's
+#         dispatch. Pass --knl-name to force an explicit kernel instead (developer
+#         experiment/compare, or a fallback when heuristic dispatch is broken).
 #         (the unified gemm_a4w4 API resolves to the same .co, so it is not
 #         tabled separately -- a second column would only be confusing).
 #
@@ -214,6 +218,7 @@ def test_gemm(
     seed=0,
     mode="perf",
     dtype=dtypes.bf16,
+    knl_name=None,
 ):
     block = MXFP4_SCALE_BLOCK if intype == "mxfp4" else NVFP4_SCALE_BLOCK
     assert K % block == 0, f"K must be a multiple of {block}"
@@ -225,30 +230,42 @@ def test_gemm(
     # quantized to e2m1 (cvt_scale=1) and written 2 vals/byte, so the reference
     # must quantize the same way and the output tensor is fp4x2 [M, N//2].
     out_fp4 = outtype == "fp4"
-    # outtype=mxfp8 selects the fp8-output kernel: the fp32 result is quantized
+    # outtype=fp8 selects the fp8-output kernel: the fp32 result is quantized
     # per 128-wide N block to fp8 e4m3 + one E8M0 scale (computed in-kernel), so
     # the reference quantizes the same way and the op returns (fp8, e8m0) tuple.
-    out_mxfp8 = outtype == "mxfp8"
-    out_dtype = dtypes.fp4x2 if out_fp4 else (dtypes.fp8 if out_mxfp8 else dtype)
+    out_fp8 = outtype == "fp8"
+    out_dtype = dtypes.fp4x2 if out_fp4 else (dtypes.fp8 if out_fp8 else dtype)
     gen = bench_init.make_generator(seed)  # fixed seed -> bit-identical buffers
     prep = _prep_mxfp4 if intype == "mxfp4" else _prep_nvfp4
     inp, ref_f32 = prep(M, N, K, apre, data_init, scale_init, gen, noscale=noscale)
     # Reference in the kernel's output form: packed e2m1 for fp4, block-scaled
-    # (fp8 e4m3 data + e8m0 scale) tuple for mxfp8, else bf16.
+    # (fp8 e4m3 data + e8m0 scale) tuple for fp8, else bf16.
     if out_fp4:
         ref = fp4_utils.f32_to_mxfp4(ref_f32)
-    elif out_mxfp8:
+    elif out_fp8:
         ref = _quant_mxfp8_blockN(ref_f32)  # (ref_fp8, ref_scale_e8m0)
     else:
         ref = ref_f32.to(dtype)
     needTrace = mode == "profile"
     num_iters = 5 if mode == "func" else 101
 
-    # Kernel/.co name for this config. See hsa/gfx1250/f4gemm/f4gemm.csv.
+    # Kernel/.co base name for this config (used for logging, and to derive the
+    # mangled knl_name when an explicit dispatch is requested). See
+    # hsa/gfx1250/f4gemm/f4gemm.csv.
     pre = "ABpreShuffle" if apre else "BpreShuffle"
     ns = "_noscale" if noscale else ""
     base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps{ns}"
-    knl = f"_ZN5aiter{len(base)}{base}E"
+
+    # Dispatch mode. Default (knl_name=None) is heuristic: kernelName="" lets the
+    # aiter op pick the .co from f4gemm.csv by (intype, a_preshuffle, outtype), so
+    # the test validates the op's dispatch. Explicit is opt-in via --knl-name:
+    # "auto" uses the per-config derived name below; any other value is used verbatim.
+    if knl_name is None:
+        knl = ""
+    elif knl_name == "auto":
+        knl = f"_ZN5aiter{len(base)}{base}E"
+    else:
+        knl = knl_name
 
     def run_asm():
         if intype == "nvfp4":
@@ -278,11 +295,11 @@ def test_gemm(
     candidates = {"asm": run_asm}
 
     flops = 2 * M * N * K
-    # Output bytes: packed fp4 = M*N/2; mxfp8 = M*N (fp8) + M*N/128 (e8m0 scale);
+    # Output bytes: packed fp4 = M*N/2; fp8 = M*N (fp8) + M*N/128 (e8m0 scale);
     # bf16 = M*N*itemsize.
     if out_fp4:
         out_bytes = (M * N) // 2
-    elif out_mxfp8:
+    elif out_fp8:
         out_bytes = M * N + M * (N // MXFP8_OUT_SCALE_BLOCK)
     else:
         out_bytes = M * N * dtype.itemsize
@@ -333,7 +350,7 @@ def test_gemm(
                 atol=0,
                 msg=f"{intype} {name} fp4",
             )
-        elif out_mxfp8:
+        elif out_fp8:
             # op returns (fp8 data [M,N], e8m0 scale in packed (M/64,scaleN,16,4)
             # layout). Unpack the scale to row-major for an exact byte compare; the
             # e4m3 data may differ on RNE ties, so compare it dequantized with tolerance.
@@ -347,14 +364,14 @@ def test_gemm(
                 out_scale_rm.view(torch.uint8).float(),
                 rtol=0,
                 atol=0,
-                msg=f"{intype} {name} mxfp8 e8m0",
+                msg=f"{intype} {name} fp8 e8m0",
             )
             err_d = checkAllclose(
                 _dequant_mxfp8_blockN(ref_fp8, ref_scale),
                 _dequant_mxfp8_blockN(out_fp8, out_scale_rm),
                 rtol=1e-1,
                 atol=1.0,
-                msg=f"{intype} {name} mxfp8",
+                msg=f"{intype} {name} fp8",
             )
             err = max(err_s, err_d)
         else:
@@ -409,11 +426,11 @@ def main():
     parser.add_argument(
         "--outtype",
         nargs="*",
-        choices=["bf16", "fp4", "mxfp8"],
+        choices=["bf16", "fp4", "fp8"],
         default=["bf16"],
         help="output-format sweep list: bf16 (default), fp4 (packed e2m1, "
-        "cvt_scale=1) or mxfp8 (fp8 e4m3 data + per-128 e8m0 scale); the fp4/"
-        "mxfp8 variants need the f4gemm_{fp4,mxfp8}_*.co, see f4gemm.csv",
+        "cvt_scale=1) or fp8 (fp8 e4m3 data + per-128 e8m0 scale); the fp4/"
+        "fp8 variants need the f4gemm_{fp4,fp8}_*.co, see f4gemm.csv",
     )
     parser.add_argument(
         "--data-init",
@@ -448,6 +465,15 @@ def main():
         type=int,
         default=0,
         help="RNG seed; same seed -> bit-identical data/scale buffers",
+    )
+    parser.add_argument(
+        "--knl-name",
+        dest="knl_name",
+        default=None,
+        help="dispatch mode. Default (unset) = heuristic: the aiter op picks the "
+        ".co from f4gemm.csv by (intype, a_preshuffle, outtype), validating dispatch. "
+        "'auto' = force the per-config derived knl_name (explicit). Any other value "
+        "= use that exact mangled knl_name for all runs (developer experiment/debug).",
     )
     parser.add_argument(
         "--mode",
@@ -508,6 +534,7 @@ def main():
                 seed=args.seed,
                 mode=args.mode,
                 dtype=dtype,
+                knl_name=args.knl_name,
             )
             for (di, si), intype, apre, sc, ot, (M, N, K) in itertools.product(
                 init_pairs, args.intype, args.apre, args.scale, args.outtype, args.shape
